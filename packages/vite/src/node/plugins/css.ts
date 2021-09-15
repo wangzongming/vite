@@ -186,7 +186,8 @@ export function cssPlugin(config: ResolvedConfig): Plugin {
       const {
         code: css,
         modules,
-        deps
+        deps,
+        map
       } = await compileCSS(
         id,
         raw,
@@ -223,7 +224,9 @@ export function cssPlugin(config: ResolvedConfig): Plugin {
                 isCSSRequest(file)
                   ? moduleGraph.createFileOnlyEntry(file)
                   : await moduleGraph.ensureEntryFromUrl(
-                      await fileToUrl(file, config, this)
+                      (
+                        await fileToUrl(file, config, this)
+                      ).replace(config.base, '/')
                     )
               )
             }
@@ -246,8 +249,7 @@ export function cssPlugin(config: ResolvedConfig): Plugin {
 
       return {
         code: css,
-        // TODO CSS source map
-        map: { mappings: '' }
+        map
       }
     }
   }
@@ -921,7 +923,8 @@ async function doUrlReplace(
 async function minifyCSS(css: string, config: ResolvedConfig) {
   const { code, warnings } = await transform(css, {
     loader: 'css',
-    minify: true
+    minify: true,
+    target: config.build.target || undefined
   })
   if (warnings.length) {
     const msgs = await formatMessages(warnings, { kind: 'warning' })
@@ -1009,7 +1012,7 @@ function loadPreprocessor(lang: PreprocessLang, root: string): any {
   try {
     // Search for the preprocessor in the root directory first, and fall back
     // to the default require paths.
-    const fallbackPaths = require.resolve.paths(lang) || []
+    const fallbackPaths = require.resolve.paths?.(lang) || []
     const resolved = require.resolve(lang, { paths: [root, ...fallbackPaths] })
     return (loadedPreprocessors[lang] = require(resolved))
   } catch (e) {

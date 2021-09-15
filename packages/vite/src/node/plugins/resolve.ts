@@ -23,7 +23,8 @@ import {
   resolveFrom,
   isDataUrl,
   cleanUrl,
-  slash
+  slash,
+  nestedResolveFrom
 } from '../utils'
 import { ViteDevServer, SSROptions } from '..'
 import { createFilter } from '@rollup/pluginutils'
@@ -44,6 +45,7 @@ export interface ResolveOptions {
   conditions?: string[]
   extensions?: string[]
   dedupe?: string[]
+  preserveSymlinks?: boolean
 }
 
 export interface InternalResolveOptions extends ResolveOptions {
@@ -108,12 +110,14 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
 
       const options = isRequire ? requireOptions : baseOptions
 
+      const preserveSymlinks = !!server?.config.resolve.preserveSymlinks
+
       let res: string | PartialResolvedId | undefined
 
       // explicit fs paths that starts with /@fs/*
       if (asSrc && id.startsWith(FS_PREFIX)) {
         const fsPath = fsPathFromId(id)
-        res = tryFsResolve(fsPath, options)
+        res = tryFsResolve(fsPath, options, preserveSymlinks)
         isDebug && debug(`[@fs] ${chalk.cyan(id)} -> ${chalk.dim(res)}`)
         // always return here even if res doesn't exist since /@fs/ is explicit
         // if the file doesn't exist it should be a 404
@@ -124,7 +128,7 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
       // /foo -> /fs-root/foo
       if (asSrc && id.startsWith('/')) {
         const fsPath = path.resolve(root, id.slice(1))
-        if ((res = tryFsResolve(fsPath, options))) {
+        if ((res = tryFsResolve(fsPath, options, preserveSymlinks))) {
           isDebug && debug(`[url] ${chalk.cyan(id)} -> ${chalk.dim(res)}`)
           return res
         }
@@ -159,12 +163,18 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
 
         if (
           targetWeb &&
-          (res = tryResolveBrowserMapping(fsPath, importer, options, true))
+          (res = tryResolveBrowserMapping(
+            fsPath,
+            importer,
+            options,
+            true,
+            preserveSymlinks
+          ))
         ) {
           return res
         }
 
-        if ((res = tryFsResolve(fsPath, options))) {
+        if ((res = tryFsResolve(fsPath, options, preserveSymlinks))) {
           isDebug && debug(`[relative] ${chalk.cyan(id)} -> ${chalk.dim(res)}`)
           const pkg = importer != null && idToPkgMap.get(importer)
           if (pkg) {
@@ -179,7 +189,10 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
       }
 
       // absolute fs paths
-      if (path.isAbsolute(id) && (res = tryFsResolve(id, options))) {
+      if (
+        path.isAbsolute(id) &&
+        (res = tryFsResolve(id, options, preserveSymlinks))
+      ) {
         isDebug && debug(`[fs] ${chalk.cyan(id)} -> ${chalk.dim(res)}`)
         return res
       }
@@ -204,14 +217,20 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
           asSrc &&
           server &&
           !ssr &&
-          (res = tryOptimizedResolve(id, server))
+          (res = tryOptimizedResolve(id, server, importer))
         ) {
           return res
         }
 
         if (
           targetWeb &&
-          (res = tryResolveBrowserMapping(id, importer, options, false))
+          (res = tryResolveBrowserMapping(
+            id,
+            importer,
+            options,
+            false,
+            preserveSymlinks
+          ))
         ) {
           return res
         }
@@ -278,6 +297,7 @@ export function resolvePlugin(baseOptions: InternalResolveOptions): Plugin {
 function tryFsResolve(
   fsPath: string,
   options: InternalResolveOptions,
+  preserveSymlinks: boolean,
   tryIndex = true,
   targetWeb = true
 ): string | undefined {
@@ -301,6 +321,7 @@ function tryFsResolve(
       options,
       false,
       targetWeb,
+      preserveSymlinks,
       options.tryPrefix,
       options.skipPackageJson
     ))
@@ -316,6 +337,7 @@ function tryFsResolve(
         options,
         false,
         targetWeb,
+        preserveSymlinks,
         options.tryPrefix,
         options.skipPackageJson
       ))
@@ -331,6 +353,7 @@ function tryFsResolve(
       options,
       tryIndex,
       targetWeb,
+      preserveSymlinks,
       options.tryPrefix,
       options.skipPackageJson
     ))
@@ -345,6 +368,7 @@ function tryResolveFile(
   options: InternalResolveOptions,
   tryIndex: boolean,
   targetWeb: boolean,
+  preserveSymlinks: boolean,
   tryPrefix?: string,
   skipPackageJson?: boolean
 ): string | undefined {
@@ -365,16 +389,30 @@ function tryResolveFile(
         if (fs.existsSync(pkgPath)) {
           // path points to a node package
           const pkg = loadPackageData(pkgPath)
-          return resolvePackageEntry(file, pkg, options, targetWeb)
+          const resolved = resolvePackageEntry(
+            file,
+            pkg,
+            options,
+            targetWeb,
+            preserveSymlinks
+          )
+          return resolved ? getRealPath(resolved, preserveSymlinks) : resolved
         }
       }
-      const index = tryFsResolve(file + '/index', options)
+      const index = tryFsResolve(file + '/index', options, preserveSymlinks)
       if (index) return index + postfix
     }
   }
   if (tryPrefix) {
     const prefixed = `${path.dirname(file)}/${tryPrefix}${path.basename(file)}`
-    return tryResolveFile(prefixed, postfix, options, tryIndex, targetWeb)
+    return tryResolveFile(
+      prefixed,
+      postfix,
+      options,
+      tryIndex,
+      targetWeb,
+      preserveSymlinks
+    )
   }
 }
 
@@ -389,8 +427,18 @@ export function tryNodeResolve(
   ssr?: boolean
 ): PartialResolvedId | undefined {
   const { root, dedupe, isBuild } = options
-  const deepMatch = id.match(deepImportRE)
-  const pkgId = deepMatch ? deepMatch[1] || deepMatch[2] : id
+
+  // split id by last '>' for nested selected packages, for example:
+  // 'foo > bar > baz' => 'foo > bar' & 'baz'
+  // 'foo'             => ''          & 'foo'
+  const lastArrowIndex = id.lastIndexOf('>')
+  const nestedRoot = id.substring(0, lastArrowIndex).trim()
+  const nestedPath = id.substring(lastArrowIndex + 1).trim()
+
+  // check for deep import, e.g. "my-lib/foo"
+  const deepMatch = nestedPath.match(deepImportRE)
+
+  const pkgId = deepMatch ? deepMatch[1] || deepMatch[2] : nestedPath
 
   let basedir: string
   if (dedupe && dedupe.includes(pkgId)) {
@@ -405,18 +453,28 @@ export function tryNodeResolve(
     basedir = root
   }
 
-  const pkg = resolvePackageData(pkgId, basedir)
+  const preserveSymlinks = !!server?.config.resolve.preserveSymlinks
+
+  // nested node module, step-by-step resolve to the basedir of the nestedPath
+  if (nestedRoot) {
+    basedir = nestedResolveFrom(nestedRoot, basedir, preserveSymlinks)
+  }
+
+  const pkg = resolvePackageData(pkgId, basedir, preserveSymlinks)
 
   if (!pkg) {
     return
   }
 
   let resolved = deepMatch
-    ? resolveDeepImport(id, pkg, options, targetWeb)
-    : resolvePackageEntry(id, pkg, options, targetWeb)
+    ? resolveDeepImport(id, pkg, options, targetWeb, preserveSymlinks)
+    : resolvePackageEntry(id, pkg, options, targetWeb, preserveSymlinks)
   if (!resolved) {
     return
   }
+
+  resolved = getRealPath(resolved, preserveSymlinks)
+
   // link id to pkg for browser field mapping check
   idToPkgMap.set(resolved, pkg)
   if (isBuild) {
@@ -465,19 +523,55 @@ export function tryNodeResolve(
 
 export function tryOptimizedResolve(
   id: string,
-  server: ViteDevServer
+  server: ViteDevServer,
+  importer?: string
 ): string | undefined {
   const cacheDir = server.config.cacheDir
   const depData = server._optimizeDepsMetadata
-  if (cacheDir && depData) {
-    const isOptimized = depData.optimized[id]
-    if (isOptimized) {
-      return (
-        isOptimized.file +
-        `?v=${depData.browserHash}${
-          isOptimized.needsInterop ? `&es-interop` : ``
-        }`
-      )
+
+  if (!cacheDir || !depData) return
+
+  const getOptimizedUrl = (optimizedData: typeof depData.optimized[string]) => {
+    return (
+      optimizedData.file +
+      `?v=${depData.browserHash}${
+        optimizedData.needsInterop ? `&es-interop` : ``
+      }`
+    )
+  }
+
+  // check if id has been optimized
+  const isOptimized = depData.optimized[id]
+  if (isOptimized) {
+    return getOptimizedUrl(isOptimized)
+  }
+
+  if (!importer) return
+
+  // further check if id is imported by nested dependency
+  let resolvedSrc: string | undefined
+
+  for (const [pkgPath, optimizedData] of Object.entries(depData.optimized)) {
+    // check for scenarios, e.g.
+    //   pkgPath  => "my-lib > foo"
+    //   id       => "foo"
+    // this narrows the need to do a full resolve
+    if (!pkgPath.endsWith(id)) continue
+
+    // lazily initialize resolvedSrc
+    if (resolvedSrc == null) {
+      try {
+        // this may throw errors if unable to resolve, e.g. aliased id
+        resolvedSrc = normalizePath(resolveFrom(id, path.dirname(importer)))
+      } catch {
+        // this is best-effort only so swallow errors
+        break
+      }
+    }
+
+    // match by src to correctly identify if id belongs to nested dependency
+    if (optimizedData.src === resolvedSrc) {
+      return getOptimizedUrl(optimizedData)
     }
   }
 }
@@ -504,14 +598,15 @@ const packageCache = new Map<string, PackageData>()
 
 export function resolvePackageData(
   id: string,
-  basedir: string
+  basedir: string,
+  preserveSymlinks = false
 ): PackageData | undefined {
   const cacheKey = id + basedir
   if (packageCache.has(cacheKey)) {
     return packageCache.get(cacheKey)
   }
   try {
-    const pkgPath = resolveFrom(`${id}/package.json`, basedir)
+    const pkgPath = resolveFrom(`${id}/package.json`, basedir, preserveSymlinks)
     return loadPackageData(pkgPath, cacheKey)
   } catch (e) {
     isDebug && debug(`${chalk.red(`[failed loading package.json]`)} ${id}`)
@@ -560,7 +655,8 @@ export function resolvePackageEntry(
   id: string,
   { dir, data, setResolvedCache, getResolvedCache }: PackageData,
   options: InternalResolveOptions,
-  targetWeb: boolean
+  targetWeb: boolean,
+  preserveSymlinks = false
 ): string | undefined {
   const cached = getResolvedCache('.', targetWeb)
   if (cached) {
@@ -597,7 +693,8 @@ export function resolvePackageEntry(
           // instead; Otherwise, assume it's ESM and use it.
           const resolvedBrowserEntry = tryFsResolve(
             path.join(dir, browserEntry),
-            options
+            options,
+            preserveSymlinks
           )
           if (resolvedBrowserEntry) {
             const content = fs.readFileSync(resolvedBrowserEntry, 'utf-8')
@@ -643,7 +740,11 @@ export function resolvePackageEntry(
     }
 
     entryPoint = path.join(dir, entryPoint)
-    const resolvedEntryPoint = tryFsResolve(entryPoint, options)
+    const resolvedEntryPoint = tryFsResolve(
+      entryPoint,
+      options,
+      preserveSymlinks
+    )
 
     if (resolvedEntryPoint) {
       isDebug &&
@@ -700,7 +801,8 @@ function resolveDeepImport(
     data
   }: PackageData,
   options: InternalResolveOptions,
-  targetWeb: boolean
+  targetWeb: boolean,
+  preserveSymlinks: boolean
 ): string | undefined {
   id = '.' + id.slice(data.name.length)
   const cache = getResolvedCache(id, targetWeb)
@@ -738,6 +840,7 @@ function resolveDeepImport(
     const resolved = tryFsResolve(
       path.join(dir, relativeId),
       options,
+      preserveSymlinks,
       !exportsField, // try index only if no exports field
       targetWeb
     )
@@ -754,7 +857,8 @@ function tryResolveBrowserMapping(
   id: string,
   importer: string | undefined,
   options: InternalResolveOptions,
-  isFilePath: boolean
+  isFilePath: boolean,
+  preserveSymlinks: boolean
 ) {
   let res: string | undefined
   const pkg = importer && idToPkgMap.get(importer)
@@ -763,7 +867,7 @@ function tryResolveBrowserMapping(
     const browserMappedPath = mapWithBrowserField(mapId, pkg.data.browser)
     if (browserMappedPath) {
       const fsPath = path.join(pkg.dir, browserMappedPath)
-      if ((res = tryFsResolve(fsPath, options))) {
+      if ((res = tryFsResolve(fsPath, options, preserveSymlinks))) {
         isDebug &&
           debug(`[browser mapped] ${chalk.cyan(id)} -> ${chalk.dim(res)}`)
         idToPkgMap.set(res, pkg)
@@ -806,4 +910,11 @@ function mapWithBrowserField(
 
 function equalWithoutSuffix(path: string, key: string, suffix: string) {
   return key.endsWith(suffix) && key.slice(0, -suffix.length) === path
+}
+
+function getRealPath(resolved: string, preserveSymlinks?: boolean): string {
+  if (!preserveSymlinks && browserExternalId !== resolved) {
+    return normalizePath(fs.realpathSync(resolved))
+  }
+  return resolved
 }
